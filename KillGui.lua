@@ -1,100 +1,151 @@
 --[[
-    Kill Player GUI - Delta Executor
-    Меню для уничтожения (респавна) ближайшего игрока.
-    Подойди к игроку и нажми кнопку "KILL" (или хоткей E).
+    Kill Player GUI - Natural Disaster Survival (Delta Executor)
+    Метод: Fling (физический выброс игрока в небо/за карту).
+    
+    Как пользоваться:
+        1. Запусти скрипт после спавна на острове.
+        2. В меню выбери игрока (или включи AUTO - ближайший).
+        3. Нажми "FLING" или хоткей [E].
+        4. Жертву выбросит вверх с огромной скоростью - она умрёт от падения
+           или вылетит за карту.
+
+    ВНИМАНИЕ: пока активен Fling, твой персонаж сам "ломается" (это часть трюка).
+    После броска нажми "RESET" или подожди - скрипт вернёт тебя в нормальное
+    состояние и зарелоадит. В лобби fling часто не работает (там анти-урон) -
+    делай это уже на острове во время раунда.
 ]]
 
-local Players = game:GetService("Players")
+local Players          = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
-local RunService = game:GetService("RunService")
-local LocalPlayer = Players.LocalPlayer
+local RunService       = game:GetService("RunService")
+local LocalPlayer      = Players.LocalPlayer
 
--- Удаляем старое меню если есть
 if game.CoreGui:FindFirstChild("KillGui") then
-    game.CoreGui:FindFirstChild("KillGui"):Destroy()
+    game.CoreGui.KillGui:Destroy()
 end
 
--- Настройки
 local SETTINGS = {
-    KillDistance     = 15,    -- Макс. дистанция для атаки (studs)
-    AutoTarget       = true,  -- Авто-выбор ближайшего
-    TeleportToPlayer = true,  -- Телепорт к жертве перед ударом
+    AutoTarget   = true,
+    FlingPower   = 90000, -- сила выброса (чем больше - тем выше летит)
+    FlingTime    = 0.7,   -- сколько секунд держать fling
 }
 
 ------------------------------------------------------------
--- Вспомогательные функции
+-- Утилиты
 ------------------------------------------------------------
 
-local function getMyRoot()
-    local char = LocalPlayer.Character
-    if not char then return nil end
-    return char:FindFirstChild("HumanoidRootPart")
+local function getMyChar()
+    local c = LocalPlayer.Character
+    if not c then return nil end
+    return c, c:FindFirstChild("HumanoidRootPart"), c:FindFirstChildOfClass("Humanoid")
 end
 
 local function getNearestPlayer()
-    local myRoot = getMyRoot()
+    local _, myRoot = getMyChar()
     if not myRoot then return nil end
-
-    local nearest, bestDist = nil, math.huge
-    for _, plr in ipairs(Players:GetPlayers()) do
-        if plr ~= LocalPlayer and plr.Character then
-            local hrp = plr.Character:FindFirstChild("HumanoidRootPart")
-            local hum = plr.Character:FindFirstChildOfClass("Humanoid")
+    local best, bestDist = nil, math.huge
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= LocalPlayer and p.Character then
+            local hrp = p.Character:FindFirstChild("HumanoidRootPart")
+            local hum = p.Character:FindFirstChildOfClass("Humanoid")
             if hrp and hum and hum.Health > 0 then
-                local dist = (hrp.Position - myRoot.Position).Magnitude
-                if dist < bestDist then
-                    bestDist = dist
-                    nearest = plr
-                end
+                local d = (hrp.Position - myRoot.Position).Magnitude
+                if d < bestDist then bestDist, best = d, p end
             end
         end
     end
-    return nearest, bestDist
+    return best, bestDist
 end
 
-local function killPlayer(target)
-    if not target or not target.Character then
-        return false, "Нет цели"
-    end
-    local myChar = LocalPlayer.Character
-    local myRoot = getMyRoot()
-    local myHum  = myChar and myChar:FindFirstChildOfClass("Humanoid")
-    local tHrp   = target.Character:FindFirstChild("HumanoidRootPart")
-    local tHum   = target.Character:FindFirstChildOfClass("Humanoid")
+------------------------------------------------------------
+-- FLING (классический "void/space fling" для NDS)
+-- Идея: даём собственному HumanoidRootPart огромный угловой импульс
+-- и ставим CFrame в позицию жертвы. Из-за того, как Roblox передаёт
+-- физику между клиентами при коллизии, импульс передаётся жертве
+-- и её выбрасывает в небо. Сервер с FilteringEnabled этому не мешает,
+-- т.к. движение твоего HRP легально, а коллизия рассчитывается физикой.
+------------------------------------------------------------
+
+local flinging = false
+
+local function flingPlayer(target)
+    if flinging then return false, "Уже летит..." end
+    if not target or not target.Character then return false, "Нет цели" end
+
+    local myChar, myRoot, myHum = getMyChar()
+    local tHrp = target.Character:FindFirstChild("HumanoidRootPart")
+    local tHum = target.Character:FindFirstChildOfClass("Humanoid")
     if not (myRoot and myHum and tHrp and tHum) then
         return false, "Проверь персонажа"
     end
-
-    local dist = (tHrp.Position - myRoot.Position).Magnitude
-    if dist > SETTINGS.KillDistance and not SETTINGS.TeleportToPlayer then
-        return false, ("Слишком далеко (%.1f)"):format(dist)
+    if tHum.Sit then
+        pcall(function() tHum.Sit = false end) -- иначе flick не сработает
     end
 
-    -- Сохраняем позицию, чтобы вернуться
-    local savedCFrame = myRoot.CFrame
+    flinging = true
+    local saved = myRoot.CFrame
 
-    if SETTINGS.TeleportToPlayer then
-        -- Несколько "ударов" телепортом - распространённый трюк, чтобы прокнул
-        -- любой touch-damage / kill-brick / батлграунды и т.п.
-        for i = 1, 5 do
-            if myRoot and myRoot.Parent and tHrp and tHrp.Parent then
-                myRoot.CFrame = tHrp.CFrame
-            end
-            task.wait()
+    -- Снимаем коллизии и массу с собственных частей,
+    -- иначе игра швырнёт нас, а не цель.
+    local restore = {}
+    for _, v in ipairs(myChar:GetDescendants()) do
+        if v:IsA("BasePart") then
+            restore[v] = { canCollide = v.CanCollide, massless = v.Massless }
+            v.CanCollide = false
+            v.Massless   = true
+        end
+    end
+    -- Отключаем физику Humanoid - меньше "брыкается"
+    pcall(function()
+        myHum:ChangeState(Enum.HumanoidStateType.Physics)
+        myHum.PlatformStand = true
+    end)
+
+    -- Сам fling: огромная угловая и линейная скорость + позиция жертвы
+    local stop = false
+    task.spawn(function()
+        local t0 = tick()
+        while not stop and tick() - t0 < SETTINGS.FlingTime do
+            if not (myRoot and myRoot.Parent and tHrp and tHrp.Parent) then break end
+            myRoot.Velocity    = Vector3.new(SETTINGS.FlingPower, SETTINGS.FlingPower, SETTINGS.FlingPower)
+            myRoot.RotVelocity = Vector3.new(SETTINGS.FlingPower, SETTINGS.FlingPower, SETTINGS.FlingPower)
+            myRoot.CFrame      = tHrp.CFrame
+            RunService.Heartbeat:Wait()
+        end
+    end)
+
+    task.wait(SETTINGS.FlingTime)
+    stop = true
+
+    -- Восстанавливаемся
+    pcall(function()
+        myHum.PlatformStand = false
+        myHum:ChangeState(Enum.HumanoidStateType.GettingUp)
+    end)
+    for v, props in pairs(restore) do
+        if v and v.Parent then
+            v.CanCollide = props.canCollide
+            v.Massless   = props.massless
         end
     end
 
-    -- Стандартные методы "убийства". Сработает только там, где разрешает игра.
-    pcall(function() tHum:TakeDamage(tHum.MaxHealth) end)
-    pcall(function() target.Character:BreakJoints() end)
-
-    -- Возврат на исходную позицию
-    task.wait(0.1)
     if myRoot and myRoot.Parent then
-        myRoot.CFrame = savedCFrame
+        myRoot.Velocity    = Vector3.new()
+        myRoot.RotVelocity = Vector3.new()
+        myRoot.CFrame      = saved + Vector3.new(0, 5, 0)
     end
 
-    return true, "Цель уничтожена: " .. target.Name
+    flinging = false
+    return true, "Fling -> " .. target.Name
+end
+
+local function resetCharacter()
+    local _, _, hum = getMyChar()
+    if hum then
+        hum.Health = 0
+    else
+        LocalPlayer.Character = nil
+    end
 end
 
 ------------------------------------------------------------
@@ -105,206 +156,265 @@ local gui = Instance.new("ScreenGui")
 gui.Name = "KillGui"
 gui.ResetOnSpawn = false
 gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+pcall(function() gui.Parent = game:GetService("CoreGui") end)
+if not gui.Parent then gui.Parent = LocalPlayer:WaitForChild("PlayerGui") end
 
--- В Delta лучше класть в CoreGui
-local parentGui = game:GetService("CoreGui")
-pcall(function() gui.Parent = parentGui end)
-if not gui.Parent then
-    gui.Parent = LocalPlayer:WaitForChild("PlayerGui")
-end
-
--- Главный фрейм
 local main = Instance.new("Frame", gui)
-main.Name = "Main"
-main.Size = UDim2.new(0, 280, 0, 240)
-main.Position = UDim2.new(0.5, -140, 0.5, -120)
-main.BackgroundColor3 = Color3.fromRGB(25, 25, 30)
+main.Size = UDim2.new(0, 300, 0, 320)
+main.Position = UDim2.new(0.5, -150, 0.5, -160)
+main.BackgroundColor3 = Color3.fromRGB(22, 22, 28)
 main.BorderSizePixel = 0
 main.Active = true
 main.Draggable = true
-
-local corner = Instance.new("UICorner", main)
-corner.CornerRadius = UDim.new(0, 10)
-
+Instance.new("UICorner", main).CornerRadius = UDim.new(0, 10)
 local stroke = Instance.new("UIStroke", main)
-stroke.Color = Color3.fromRGB(255, 60, 60)
+stroke.Color = Color3.fromRGB(255, 80, 80)
 stroke.Thickness = 1.5
 
--- Заголовок
 local title = Instance.new("TextLabel", main)
-title.Size = UDim2.new(1, 0, 0, 35)
-title.BackgroundColor3 = Color3.fromRGB(35, 35, 45)
-title.BorderSizePixel = 0
-title.Text = "  💀  KILL MENU"
+title.Size = UDim2.new(1, 0, 0, 36)
+title.BackgroundColor3 = Color3.fromRGB(35, 35, 50)
+title.Text = "  🌪  NDS KILL MENU"
 title.TextXAlignment = Enum.TextXAlignment.Left
-title.TextColor3 = Color3.fromRGB(255, 80, 80)
+title.TextColor3 = Color3.fromRGB(255, 90, 90)
 title.Font = Enum.Font.GothamBold
 title.TextSize = 16
 Instance.new("UICorner", title).CornerRadius = UDim.new(0, 10)
 
--- Кнопка свернуть
-local minBtn = Instance.new("TextButton", title)
-minBtn.Size = UDim2.new(0, 30, 0, 30)
-minBtn.Position = UDim2.new(1, -66, 0, 2)
-minBtn.BackgroundColor3 = Color3.fromRGB(80, 80, 100)
-minBtn.Text = "—"
-minBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-minBtn.Font = Enum.Font.GothamBold
-minBtn.TextSize = 14
-Instance.new("UICorner", minBtn).CornerRadius = UDim.new(0, 6)
-
--- Кнопка закрыть
 local closeBtn = Instance.new("TextButton", title)
 closeBtn.Size = UDim2.new(0, 30, 0, 30)
-closeBtn.Position = UDim2.new(1, -33, 0, 2)
+closeBtn.Position = UDim2.new(1, -33, 0, 3)
 closeBtn.BackgroundColor3 = Color3.fromRGB(200, 50, 50)
 closeBtn.Text = "X"
-closeBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+closeBtn.TextColor3 = Color3.new(1,1,1)
 closeBtn.Font = Enum.Font.GothamBold
 closeBtn.TextSize = 14
 Instance.new("UICorner", closeBtn).CornerRadius = UDim.new(0, 6)
 
--- Информация о цели
-local targetLabel = Instance.new("TextLabel", main)
-targetLabel.Size = UDim2.new(1, -20, 0, 22)
-targetLabel.Position = UDim2.new(0, 10, 0, 45)
-targetLabel.BackgroundTransparency = 1
-targetLabel.Text = "Цель: ---"
-targetLabel.TextXAlignment = Enum.TextXAlignment.Left
-targetLabel.TextColor3 = Color3.fromRGB(220, 220, 220)
-targetLabel.Font = Enum.Font.Gotham
-targetLabel.TextSize = 14
+local minBtn = Instance.new("TextButton", title)
+minBtn.Size = UDim2.new(0, 30, 0, 30)
+minBtn.Position = UDim2.new(1, -66, 0, 3)
+minBtn.BackgroundColor3 = Color3.fromRGB(80, 80, 100)
+minBtn.Text = "—"
+minBtn.TextColor3 = Color3.new(1,1,1)
+minBtn.Font = Enum.Font.GothamBold
+minBtn.TextSize = 14
+Instance.new("UICorner", minBtn).CornerRadius = UDim.new(0, 6)
 
-local distLabel = Instance.new("TextLabel", main)
-distLabel.Size = UDim2.new(1, -20, 0, 22)
-distLabel.Position = UDim2.new(0, 10, 0, 70)
-distLabel.BackgroundTransparency = 1
-distLabel.Text = "Дистанция: ---"
-distLabel.TextXAlignment = Enum.TextXAlignment.Left
-distLabel.TextColor3 = Color3.fromRGB(180, 180, 180)
-distLabel.Font = Enum.Font.Gotham
-distLabel.TextSize = 13
+-- Лейблы цели
+local targetLbl = Instance.new("TextLabel", main)
+targetLbl.Size = UDim2.new(1, -20, 0, 22)
+targetLbl.Position = UDim2.new(0, 10, 0, 46)
+targetLbl.BackgroundTransparency = 1
+targetLbl.Text = "Цель: ---"
+targetLbl.TextXAlignment = Enum.TextXAlignment.Left
+targetLbl.TextColor3 = Color3.fromRGB(220, 220, 220)
+targetLbl.Font = Enum.Font.GothamBold
+targetLbl.TextSize = 14
 
--- Кнопка KILL
-local killBtn = Instance.new("TextButton", main)
-killBtn.Size = UDim2.new(1, -20, 0, 55)
-killBtn.Position = UDim2.new(0, 10, 0, 105)
-killBtn.BackgroundColor3 = Color3.fromRGB(200, 40, 40)
-killBtn.Text = "💥 KILL ближайшего игрока"
-killBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-killBtn.Font = Enum.Font.GothamBold
-killBtn.TextSize = 15
-killBtn.AutoButtonColor = true
-Instance.new("UICorner", killBtn).CornerRadius = UDim.new(0, 8)
+local distLbl = Instance.new("TextLabel", main)
+distLbl.Size = UDim2.new(1, -20, 0, 22)
+distLbl.Position = UDim2.new(0, 10, 0, 70)
+distLbl.BackgroundTransparency = 1
+distLbl.Text = "Дистанция: ---"
+distLbl.TextXAlignment = Enum.TextXAlignment.Left
+distLbl.TextColor3 = Color3.fromRGB(180, 180, 180)
+distLbl.Font = Enum.Font.Gotham
+distLbl.TextSize = 13
 
--- Тогл "Телепорт"
-local tpToggle = Instance.new("TextButton", main)
-tpToggle.Size = UDim2.new(0.5, -15, 0, 30)
-tpToggle.Position = UDim2.new(0, 10, 0, 170)
-tpToggle.BackgroundColor3 = Color3.fromRGB(40, 120, 60)
-tpToggle.Text = "TP: ON"
-tpToggle.TextColor3 = Color3.fromRGB(255, 255, 255)
-tpToggle.Font = Enum.Font.GothamBold
-tpToggle.TextSize = 13
-Instance.new("UICorner", tpToggle).CornerRadius = UDim.new(0, 6)
+-- Список игроков (TextBox для выбора по имени)
+local nameBox = Instance.new("TextBox", main)
+nameBox.Size = UDim2.new(1, -20, 0, 30)
+nameBox.Position = UDim2.new(0, 10, 0, 100)
+nameBox.PlaceholderText = "Имя игрока (пусто = ближайший)"
+nameBox.Text = ""
+nameBox.BackgroundColor3 = Color3.fromRGB(40, 40, 50)
+nameBox.TextColor3 = Color3.new(1,1,1)
+nameBox.Font = Enum.Font.Gotham
+nameBox.TextSize = 13
+nameBox.ClearTextOnFocus = false
+Instance.new("UICorner", nameBox).CornerRadius = UDim.new(0, 6)
 
--- Тогл "Авто-цель"
-local autoToggle = Instance.new("TextButton", main)
-autoToggle.Size = UDim2.new(0.5, -15, 0, 30)
-autoToggle.Position = UDim2.new(0.5, 5, 0, 170)
-autoToggle.BackgroundColor3 = Color3.fromRGB(40, 120, 60)
-autoToggle.Text = "AUTO: ON"
-autoToggle.TextColor3 = Color3.fromRGB(255, 255, 255)
-autoToggle.Font = Enum.Font.GothamBold
-autoToggle.TextSize = 13
-Instance.new("UICorner", autoToggle).CornerRadius = UDim.new(0, 6)
+-- Кнопка FLING
+local flingBtn = Instance.new("TextButton", main)
+flingBtn.Size = UDim2.new(1, -20, 0, 50)
+flingBtn.Position = UDim2.new(0, 10, 0, 140)
+flingBtn.BackgroundColor3 = Color3.fromRGB(200, 40, 40)
+flingBtn.Text = "🌪 FLING (выбросить)"
+flingBtn.TextColor3 = Color3.new(1,1,1)
+flingBtn.Font = Enum.Font.GothamBold
+flingBtn.TextSize = 16
+Instance.new("UICorner", flingBtn).CornerRadius = UDim.new(0, 8)
+
+-- Слайдер силы (просто +/-)
+local powerLbl = Instance.new("TextLabel", main)
+powerLbl.Size = UDim2.new(1, -20, 0, 20)
+powerLbl.Position = UDim2.new(0, 10, 0, 198)
+powerLbl.BackgroundTransparency = 1
+powerLbl.Text = "Сила: " .. SETTINGS.FlingPower
+powerLbl.TextXAlignment = Enum.TextXAlignment.Left
+powerLbl.TextColor3 = Color3.fromRGB(200, 200, 200)
+powerLbl.Font = Enum.Font.Gotham
+powerLbl.TextSize = 12
+
+local minusBtn = Instance.new("TextButton", main)
+minusBtn.Size = UDim2.new(0, 30, 0, 25)
+minusBtn.Position = UDim2.new(1, -75, 0, 196)
+minusBtn.BackgroundColor3 = Color3.fromRGB(70, 70, 90)
+minusBtn.Text = "-"
+minusBtn.TextColor3 = Color3.new(1,1,1)
+minusBtn.Font = Enum.Font.GothamBold
+minusBtn.TextSize = 16
+Instance.new("UICorner", minusBtn).CornerRadius = UDim.new(0, 4)
+
+local plusBtn = Instance.new("TextButton", main)
+plusBtn.Size = UDim2.new(0, 30, 0, 25)
+plusBtn.Position = UDim2.new(1, -40, 0, 196)
+plusBtn.BackgroundColor3 = Color3.fromRGB(70, 70, 90)
+plusBtn.Text = "+"
+plusBtn.TextColor3 = Color3.new(1,1,1)
+plusBtn.Font = Enum.Font.GothamBold
+plusBtn.TextSize = 16
+Instance.new("UICorner", plusBtn).CornerRadius = UDim.new(0, 4)
+
+-- Тогл AUTO
+local autoBtn = Instance.new("TextButton", main)
+autoBtn.Size = UDim2.new(0.5, -15, 0, 30)
+autoBtn.Position = UDim2.new(0, 10, 0, 228)
+autoBtn.BackgroundColor3 = Color3.fromRGB(40, 120, 60)
+autoBtn.Text = "AUTO: ON"
+autoBtn.TextColor3 = Color3.new(1,1,1)
+autoBtn.Font = Enum.Font.GothamBold
+autoBtn.TextSize = 13
+Instance.new("UICorner", autoBtn).CornerRadius = UDim.new(0, 6)
+
+-- Reset character
+local resetBtn = Instance.new("TextButton", main)
+resetBtn.Size = UDim2.new(0.5, -15, 0, 30)
+resetBtn.Position = UDim2.new(0.5, 5, 0, 228)
+resetBtn.BackgroundColor3 = Color3.fromRGB(60, 80, 160)
+resetBtn.Text = "🔄 RESET ME"
+resetBtn.TextColor3 = Color3.new(1,1,1)
+resetBtn.Font = Enum.Font.GothamBold
+resetBtn.TextSize = 13
+Instance.new("UICorner", resetBtn).CornerRadius = UDim.new(0, 6)
 
 -- Статус
-local statusLabel = Instance.new("TextLabel", main)
-statusLabel.Size = UDim2.new(1, -20, 0, 22)
-statusLabel.Position = UDim2.new(0, 10, 1, -28)
-statusLabel.BackgroundTransparency = 1
-statusLabel.Text = "Готов. Хоткей: [E]"
-statusLabel.TextColor3 = Color3.fromRGB(120, 220, 120)
-statusLabel.Font = Enum.Font.Gotham
-statusLabel.TextSize = 12
-statusLabel.TextXAlignment = Enum.TextXAlignment.Left
+local statusLbl = Instance.new("TextLabel", main)
+statusLbl.Size = UDim2.new(1, -20, 0, 40)
+statusLbl.Position = UDim2.new(0, 10, 1, -45)
+statusLbl.BackgroundTransparency = 1
+statusLbl.Text = "Готов. Хоткей: [E] - fling, [R] - reset"
+statusLbl.TextColor3 = Color3.fromRGB(120, 220, 120)
+statusLbl.Font = Enum.Font.Gotham
+statusLbl.TextSize = 12
+statusLbl.TextWrapped = true
+statusLbl.TextXAlignment = Enum.TextXAlignment.Left
+statusLbl.TextYAlignment = Enum.TextYAlignment.Top
 
 ------------------------------------------------------------
--- Логика
+-- Обработчики
 ------------------------------------------------------------
 
 local minimized = false
 minBtn.MouseButton1Click:Connect(function()
     minimized = not minimized
-    local size = minimized and UDim2.new(0, 280, 0, 35) or UDim2.new(0, 280, 0, 240)
-    main:TweenSize(size, Enum.EasingDirection.Out, Enum.EasingStyle.Quad, 0.2, true)
+    main:TweenSize(minimized and UDim2.new(0,300,0,36) or UDim2.new(0,300,0,320),
+        Enum.EasingDirection.Out, Enum.EasingStyle.Quad, 0.2, true)
 end)
+closeBtn.MouseButton1Click:Connect(function() gui:Destroy() end)
 
-closeBtn.MouseButton1Click:Connect(function()
-    gui:Destroy()
-end)
-
-tpToggle.MouseButton1Click:Connect(function()
-    SETTINGS.TeleportToPlayer = not SETTINGS.TeleportToPlayer
-    tpToggle.Text = "TP: " .. (SETTINGS.TeleportToPlayer and "ON" or "OFF")
-    tpToggle.BackgroundColor3 = SETTINGS.TeleportToPlayer
-        and Color3.fromRGB(40, 120, 60) or Color3.fromRGB(120, 40, 40)
-end)
-
-autoToggle.MouseButton1Click:Connect(function()
+autoBtn.MouseButton1Click:Connect(function()
     SETTINGS.AutoTarget = not SETTINGS.AutoTarget
-    autoToggle.Text = "AUTO: " .. (SETTINGS.AutoTarget and "ON" or "OFF")
-    autoToggle.BackgroundColor3 = SETTINGS.AutoTarget
-        and Color3.fromRGB(40, 120, 60) or Color3.fromRGB(120, 40, 40)
+    autoBtn.Text = "AUTO: " .. (SETTINGS.AutoTarget and "ON" or "OFF")
+    autoBtn.BackgroundColor3 = SETTINGS.AutoTarget
+        and Color3.fromRGB(40,120,60) or Color3.fromRGB(120,40,40)
 end)
+
+minusBtn.MouseButton1Click:Connect(function()
+    SETTINGS.FlingPower = math.max(10000, SETTINGS.FlingPower - 10000)
+    powerLbl.Text = "Сила: " .. SETTINGS.FlingPower
+end)
+plusBtn.MouseButton1Click:Connect(function()
+    SETTINGS.FlingPower = math.min(500000, SETTINGS.FlingPower + 10000)
+    powerLbl.Text = "Сила: " .. SETTINGS.FlingPower
+end)
+
+resetBtn.MouseButton1Click:Connect(resetCharacter)
 
 local function setStatus(text, color)
-    statusLabel.Text = text
-    statusLabel.TextColor3 = color or Color3.fromRGB(120, 220, 120)
+    statusLbl.Text = text
+    statusLbl.TextColor3 = color or Color3.fromRGB(120, 220, 120)
 end
 
-local busy = false
-local function doKill()
-    if busy then return end
-    busy = true
-    local target = getNearestPlayer()
+local function resolveTarget()
+    local typed = nameBox.Text and nameBox.Text:gsub("^%s+",""):gsub("%s+$","") or ""
+    if typed ~= "" then
+        local low = typed:lower()
+        for _, p in ipairs(Players:GetPlayers()) do
+            if p ~= LocalPlayer and (p.Name:lower():sub(1, #low) == low
+               or (p.DisplayName and p.DisplayName:lower():sub(1, #low) == low)) then
+                return p
+            end
+        end
+        return nil, "Игрок '" .. typed .. "' не найден"
+    end
+    if SETTINGS.AutoTarget then
+        return getNearestPlayer()
+    end
+    return nil, "Введи имя или включи AUTO"
+end
+
+local function doFling()
+    local target, err = resolveTarget()
     if not target then
-        setStatus("Игроки не найдены", Color3.fromRGB(255, 120, 120))
-        busy = false
+        setStatus(err or "Нет цели", Color3.fromRGB(255,120,120))
         return
     end
-    local ok, msg = killPlayer(target)
-    setStatus(msg, ok and Color3.fromRGB(120, 220, 120) or Color3.fromRGB(255, 150, 80))
-    task.wait(0.5)
-    busy = false
+    setStatus("Fling -> " .. target.Name .. " ...", Color3.fromRGB(255,200,80))
+    local ok, msg = flingPlayer(target)
+    setStatus(msg, ok and Color3.fromRGB(120,220,120) or Color3.fromRGB(255,150,80))
 end
 
-killBtn.MouseButton1Click:Connect(function()
-    task.spawn(doKill)
-end)
+flingBtn.MouseButton1Click:Connect(function() task.spawn(doFling) end)
 
--- Хоткей E
 UserInputService.InputBegan:Connect(function(input, processed)
     if processed then return end
     if input.KeyCode == Enum.KeyCode.E then
-        task.spawn(doKill)
+        task.spawn(doFling)
+    elseif input.KeyCode == Enum.KeyCode.R then
+        resetCharacter()
     end
 end)
 
--- Обновление информации о цели
+-- Реселект персонажа после respawn
+LocalPlayer.CharacterAdded:Connect(function() flinging = false end)
+
+-- Обновление инфо
 RunService.Heartbeat:Connect(function()
-    local target, dist = getNearestPlayer()
-    if target then
-        targetLabel.Text = "Цель: " .. target.Name
-        distLabel.Text   = ("Дистанция: %.1f studs"):format(dist or 0)
-        distLabel.TextColor3 = (dist and dist <= SETTINGS.KillDistance)
-            and Color3.fromRGB(120, 255, 120) or Color3.fromRGB(255, 180, 80)
+    local target, dist
+    local typed = nameBox.Text and nameBox.Text:gsub("^%s+",""):gsub("%s+$","") or ""
+    if typed ~= "" then
+        for _, p in ipairs(Players:GetPlayers()) do
+            if p ~= LocalPlayer and p.Name:lower():sub(1,#typed) == typed:lower() then
+                target = p
+                local _, myRoot = getMyChar()
+                local hrp = p.Character and p.Character:FindFirstChild("HumanoidRootPart")
+                if myRoot and hrp then dist = (myRoot.Position - hrp.Position).Magnitude end
+                break
+            end
+        end
     else
-        targetLabel.Text = "Цель: ---"
-        distLabel.Text   = "Дистанция: ---"
+        target, dist = getNearestPlayer()
+    end
+    if target then
+        targetLbl.Text = "Цель: " .. target.Name
+        distLbl.Text   = dist and ("Дистанция: %.1f studs"):format(dist) or "Дистанция: ---"
+    else
+        targetLbl.Text = "Цель: ---"
+        distLbl.Text   = "Дистанция: ---"
     end
 end)
 
-setStatus("GUI загружен. Жми KILL или [E]")
-print("[KillGui] Загружен. Игрок:", LocalPlayer.Name)
+setStatus("GUI загружен. Жми FLING или [E].")
+print("[NDS-KillGui] Загружен. Игрок:", LocalPlayer.Name)
