@@ -1,18 +1,15 @@
 --[[
-    Kill Player GUI - Natural Disaster Survival (Delta Executor)
-    Метод: Fling (физический выброс игрока в небо/за карту).
-    
-    Как пользоваться:
-        1. Запусти скрипт после спавна на острове.
-        2. В меню выбери игрока (или включи AUTO - ближайший).
-        3. Нажми "FLING" или хоткей [E].
-        4. Жертву выбросит вверх с огромной скоростью - она умрёт от падения
-           или вылетит за карту.
+    Auto-Block + Auto-Attack GUI (Delta Executor)
+    Под игру, использующую remote: Character.Network
+        FDown / FUp     -> блок
+        M1Down / M1Up   -> удар
+        Skill {Number}  -> 1..4 скиллы
 
-    ВНИМАНИЕ: пока активен Fling, твой персонаж сам "ломается" (это часть трюка).
-    После броска нажми "RESET" или подожди - скрипт вернёт тебя в нормальное
-    состояние и зарелоадит. В лобби fling часто не работает (там анти-урон) -
-    делай это уже на острове во время раунда.
+    Логика:
+      * Слушаем анимации каждого вражеского Animator.
+      * Когда враг (из вайтлиста) в радиусе и смотрит на нас начинает
+        анимацию (любую, кроме walk/idle) - мгновенно жмём FDown.
+      * Через короткое окно отпускаем FUp и сразу бьём M1 (комбо).
 ]]
 
 local Players          = game:GetService("Players")
@@ -20,401 +17,448 @@ local UserInputService = game:GetService("UserInputService")
 local RunService       = game:GetService("RunService")
 local LocalPlayer      = Players.LocalPlayer
 
-if game.CoreGui:FindFirstChild("KillGui") then
-    game.CoreGui.KillGui:Destroy()
+if game.CoreGui:FindFirstChild("AutoBlockGui") then
+    game.CoreGui.AutoBlockGui:Destroy()
 end
 
-local SETTINGS = {
-    AutoTarget   = true,
-    FlingPower   = 90000, -- сила выброса (чем больше - тем выше летит)
-    FlingTime    = 0.7,   -- сколько секунд держать fling
+------------------------------------------------------------
+-- Настройки
+------------------------------------------------------------
+local CFG = {
+    AutoBlock     = true,
+    AutoAttack    = true,
+    Radius        = 14,        -- studs
+    BlockHold     = 0.18,      -- сколько держать блок
+    AttackCombo   = 4,         -- сколько M1 после блока
+    AttackDelay   = 0.08,      -- пауза между ударами
+    FacingDot     = 0.35,      -- насколько враг должен смотреть на нас (0..1)
+    Cooldown      = 0.35,      -- мин. пауза между срабатываниями (анти-спам)
+    IgnoreAnims   = {          -- игнорируем эти ключевые слова в имени анимы
+        ["walk"]=true, ["run"]=true, ["idle"]=true, ["jump"]=true,
+        ["fall"]=true, ["climb"]=true, ["sit"]=true, ["swim"]=true,
+        ["land"]=true, ["pose"]=true, ["dance"]=true,
+    },
 }
 
-------------------------------------------------------------
--- Утилиты
-------------------------------------------------------------
+local Whitelist = {} -- [UserId] = true (кого автоблочить/бить). По умолчанию все.
 
-local function getMyChar()
+------------------------------------------------------------
+-- Network firer
+------------------------------------------------------------
+local function getNetwork()
+    local char = LocalPlayer.Character
+    if not char then return nil end
+    return char:FindFirstChild("Network")
+end
+
+local function fire(payload)
+    local net = getNetwork()
+    if not net then return end
+    pcall(function() net:FireServer(payload) end)
+end
+
+local function blockDown() fire({Request = "FDown"}) end
+local function blockUp()   fire({Request = "FUp"})   end
+local function m1Down()    fire({Request = "M1Down"}) end
+local function m1Up()      fire({Request = "M1Up"})   end
+local function useSkill(n) fire({Number = tostring(n), Request = "Skill"}) end
+
+------------------------------------------------------------
+-- Helpers
+------------------------------------------------------------
+local function getMyRoot()
     local c = LocalPlayer.Character
     if not c then return nil end
-    return c, c:FindFirstChild("HumanoidRootPart"), c:FindFirstChildOfClass("Humanoid")
+    return c:FindFirstChild("HumanoidRootPart")
 end
 
-local function getNearestPlayer()
-    local _, myRoot = getMyChar()
-    if not myRoot then return nil end
-    local best, bestDist = nil, math.huge
-    for _, p in ipairs(Players:GetPlayers()) do
-        if p ~= LocalPlayer and p.Character then
-            local hrp = p.Character:FindFirstChild("HumanoidRootPart")
-            local hum = p.Character:FindFirstChildOfClass("Humanoid")
-            if hrp and hum and hum.Health > 0 then
-                local d = (hrp.Position - myRoot.Position).Magnitude
-                if d < bestDist then bestDist, best = d, p end
-            end
-        end
-    end
-    return best, bestDist
+local function isWhitelisted(plr)
+    -- По умолчанию (если вайтлист пуст) - все враги
+    if next(Whitelist) == nil then return true end
+    return Whitelist[plr.UserId] == true
+end
+
+local function distAndFacing(enemy)
+    local myRoot = getMyRoot()
+    if not myRoot or not enemy.Character then return nil, nil end
+    local hrp = enemy.Character:FindFirstChild("HumanoidRootPart")
+    if not hrp then return nil, nil end
+    local d = (hrp.Position - myRoot.Position).Magnitude
+    local toMe = (myRoot.Position - hrp.Position)
+    if toMe.Magnitude < 0.001 then return d, 1 end
+    local dot = hrp.CFrame.LookVector:Dot(toMe.Unit)
+    return d, dot
 end
 
 ------------------------------------------------------------
--- FLING (классический "void/space fling" для NDS)
--- Идея: даём собственному HumanoidRootPart огромный угловой импульс
--- и ставим CFrame в позицию жертвы. Из-за того, как Roblox передаёт
--- физику между клиентами при коллизии, импульс передаётся жертве
--- и её выбрасывает в небо. Сервер с FilteringEnabled этому не мешает,
--- т.к. движение твоего HRP легально, а коллизия рассчитывается физикой.
+-- Реакция на атаку
 ------------------------------------------------------------
+local lastReact = 0
+local reacting  = false
 
-local flinging = false
-
-local function flingPlayer(target)
-    if flinging then return false, "Уже летит..." end
-    if not target or not target.Character then return false, "Нет цели" end
-
-    local myChar, myRoot, myHum = getMyChar()
-    local tHrp = target.Character:FindFirstChild("HumanoidRootPart")
-    local tHum = target.Character:FindFirstChildOfClass("Humanoid")
-    if not (myRoot and myHum and tHrp and tHum) then
-        return false, "Проверь персонажа"
-    end
-    if tHum.Sit then
-        pcall(function() tHum.Sit = false end) -- иначе flick не сработает
-    end
-
-    flinging = true
-    local saved = myRoot.CFrame
-
-    -- Снимаем коллизии и массу с собственных частей,
-    -- иначе игра швырнёт нас, а не цель.
-    local restore = {}
-    for _, v in ipairs(myChar:GetDescendants()) do
-        if v:IsA("BasePart") then
-            restore[v] = { canCollide = v.CanCollide, massless = v.Massless }
-            v.CanCollide = false
-            v.Massless   = true
+local function isAttackAnim(track)
+    local name = (track.Animation and track.Animation.Name or track.Name or ""):lower()
+    if name == "" then return true end -- нет имени - на всякий случай считаем атакой
+    for k in pairs(CFG.IgnoreAnims) do
+        if name:find(k, 1, true) then return false end
         end
-    end
-    -- Отключаем физику Humanoid - меньше "брыкается"
-    pcall(function()
-        myHum:ChangeState(Enum.HumanoidStateType.Physics)
-        myHum.PlatformStand = true
-    end)
-
-    -- Сам fling: огромная угловая и линейная скорость + позиция жертвы
-    local stop = false
-    task.spawn(function()
-        local t0 = tick()
-        while not stop and tick() - t0 < SETTINGS.FlingTime do
-            if not (myRoot and myRoot.Parent and tHrp and tHrp.Parent) then break end
-            myRoot.Velocity    = Vector3.new(SETTINGS.FlingPower, SETTINGS.FlingPower, SETTINGS.FlingPower)
-            myRoot.RotVelocity = Vector3.new(SETTINGS.FlingPower, SETTINGS.FlingPower, SETTINGS.FlingPower)
-            myRoot.CFrame      = tHrp.CFrame
-            RunService.Heartbeat:Wait()
-        end
-    end)
-
-    task.wait(SETTINGS.FlingTime)
-    stop = true
-
-    -- Восстанавливаемся
-    pcall(function()
-        myHum.PlatformStand = false
-        myHum:ChangeState(Enum.HumanoidStateType.GettingUp)
-    end)
-    for v, props in pairs(restore) do
-        if v and v.Parent then
-            v.CanCollide = props.canCollide
-            v.Massless   = props.massless
-        end
-    end
-
-    if myRoot and myRoot.Parent then
-        myRoot.Velocity    = Vector3.new()
-        myRoot.RotVelocity = Vector3.new()
-        myRoot.CFrame      = saved + Vector3.new(0, 5, 0)
-    end
-
-    flinging = false
-    return true, "Fling -> " .. target.Name
+    return true
 end
 
-local function resetCharacter()
-    local _, _, hum = getMyChar()
-    if hum then
-        hum.Health = 0
-    else
-        LocalPlayer.Character = nil
+local function react(enemy)
+    if reacting then return end
+    if tick() - lastReact < CFG.Cooldown then return end
+    if not CFG.AutoBlock then return end
+
+    reacting  = true
+    lastReact = tick()
+
+    -- Блок
+    blockDown()
+    task.wait(CFG.BlockHold)
+    blockUp()
+
+    -- Контратака
+    if CFG.AutoAttack then
+        for i = 1, CFG.AttackCombo do
+            if not enemy or not enemy.Character then break end
+            m1Down()
+            task.wait(0.02)
+            m1Up()
+            task.wait(CFG.AttackDelay)
+        end
     end
+
+    reacting = false
 end
+
+------------------------------------------------------------
+-- Подключение слушателей анимаций к каждому врагу
+------------------------------------------------------------
+local hooked = {} -- [Player] = {connections}
+
+local function unhook(plr)
+    local h = hooked[plr]
+    if not h then return end
+    for _, c in ipairs(h) do pcall(function() c:Disconnect() end) end
+    hooked[plr] = nil
+end
+
+local function hookCharacter(plr, char)
+    unhook(plr)
+    if plr == LocalPlayer then return end
+
+    local conns = {}
+    hooked[plr] = conns
+
+    local function attach(animator)
+        if not animator then return end
+        local c = animator.AnimationPlayed:Connect(function(track)
+            if not CFG.AutoBlock then return end
+            if not isWhitelisted(plr) then return end
+            if not isAttackAnim(track) then return end
+
+            local dist, dot = distAndFacing(plr)
+            if not dist then return end
+            if dist > CFG.Radius then return end
+            if (dot or 1) < CFG.FacingDot then return end
+
+            task.spawn(react, plr)
+        end)
+        table.insert(conns, c)
+    end
+
+    -- Animator может появиться не сразу
+    local hum = char:FindFirstChildOfClass("Humanoid")
+        or char:WaitForChild("Humanoid", 5)
+    if not hum then return end
+    local animator = hum:FindFirstChildOfClass("Animator")
+        or hum:WaitForChild("Animator", 5)
+    attach(animator)
+
+    -- Если переcоздадут аниматор
+    table.insert(conns, hum.ChildAdded:Connect(function(c)
+        if c:IsA("Animator") then attach(c) end
+    end))
+end
+
+local function hookPlayer(plr)
+    if plr == LocalPlayer then return end
+    if plr.Character then hookCharacter(plr, plr.Character) end
+    plr.CharacterAdded:Connect(function(c) hookCharacter(plr, c) end)
+end
+
+for _, p in ipairs(Players:GetPlayers()) do hookPlayer(p) end
+Players.PlayerAdded:Connect(hookPlayer)
+Players.PlayerRemoving:Connect(function(p)
+    unhook(p)
+    Whitelist[p.UserId] = nil
+end)
 
 ------------------------------------------------------------
 -- GUI
 ------------------------------------------------------------
-
 local gui = Instance.new("ScreenGui")
-gui.Name = "KillGui"
+gui.Name = "AutoBlockGui"
 gui.ResetOnSpawn = false
 gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 pcall(function() gui.Parent = game:GetService("CoreGui") end)
 if not gui.Parent then gui.Parent = LocalPlayer:WaitForChild("PlayerGui") end
 
 local main = Instance.new("Frame", gui)
-main.Size = UDim2.new(0, 300, 0, 320)
-main.Position = UDim2.new(0.5, -150, 0.5, -160)
+main.Size = UDim2.new(0, 320, 0, 420)
+main.Position = UDim2.new(0, 30, 0.5, -210)
 main.BackgroundColor3 = Color3.fromRGB(22, 22, 28)
 main.BorderSizePixel = 0
 main.Active = true
 main.Draggable = true
 Instance.new("UICorner", main).CornerRadius = UDim.new(0, 10)
 local stroke = Instance.new("UIStroke", main)
-stroke.Color = Color3.fromRGB(255, 80, 80)
+stroke.Color = Color3.fromRGB(100, 200, 255)
 stroke.Thickness = 1.5
 
+-- Title
 local title = Instance.new("TextLabel", main)
 title.Size = UDim2.new(1, 0, 0, 36)
 title.BackgroundColor3 = Color3.fromRGB(35, 35, 50)
-title.Text = "  🌪  NDS KILL MENU"
+title.Text = "  ⚔  AUTO-BLOCK / AUTO-HIT"
 title.TextXAlignment = Enum.TextXAlignment.Left
-title.TextColor3 = Color3.fromRGB(255, 90, 90)
+title.TextColor3 = Color3.fromRGB(120, 200, 255)
 title.Font = Enum.Font.GothamBold
-title.TextSize = 16
+title.TextSize = 15
 Instance.new("UICorner", title).CornerRadius = UDim.new(0, 10)
 
 local closeBtn = Instance.new("TextButton", title)
-closeBtn.Size = UDim2.new(0, 30, 0, 30)
-closeBtn.Position = UDim2.new(1, -33, 0, 3)
+closeBtn.Size = UDim2.new(0, 28, 0, 28)
+closeBtn.Position = UDim2.new(1, -32, 0, 4)
 closeBtn.BackgroundColor3 = Color3.fromRGB(200, 50, 50)
 closeBtn.Text = "X"
 closeBtn.TextColor3 = Color3.new(1,1,1)
 closeBtn.Font = Enum.Font.GothamBold
-closeBtn.TextSize = 14
+closeBtn.TextSize = 13
 Instance.new("UICorner", closeBtn).CornerRadius = UDim.new(0, 6)
 
 local minBtn = Instance.new("TextButton", title)
-minBtn.Size = UDim2.new(0, 30, 0, 30)
-minBtn.Position = UDim2.new(1, -66, 0, 3)
+minBtn.Size = UDim2.new(0, 28, 0, 28)
+minBtn.Position = UDim2.new(1, -64, 0, 4)
 minBtn.BackgroundColor3 = Color3.fromRGB(80, 80, 100)
 minBtn.Text = "—"
 minBtn.TextColor3 = Color3.new(1,1,1)
 minBtn.Font = Enum.Font.GothamBold
-minBtn.TextSize = 14
+minBtn.TextSize = 13
 Instance.new("UICorner", minBtn).CornerRadius = UDim.new(0, 6)
 
--- Лейблы цели
-local targetLbl = Instance.new("TextLabel", main)
-targetLbl.Size = UDim2.new(1, -20, 0, 22)
-targetLbl.Position = UDim2.new(0, 10, 0, 46)
-targetLbl.BackgroundTransparency = 1
-targetLbl.Text = "Цель: ---"
-targetLbl.TextXAlignment = Enum.TextXAlignment.Left
-targetLbl.TextColor3 = Color3.fromRGB(220, 220, 220)
-targetLbl.Font = Enum.Font.GothamBold
-targetLbl.TextSize = 14
+------------------------------------------------------------
+-- Хелпер для тогла
+------------------------------------------------------------
+local function makeToggle(parent, posY, label, initial, onChange)
+    local btn = Instance.new("TextButton", parent)
+    btn.Size = UDim2.new(1, -20, 0, 30)
+    btn.Position = UDim2.new(0, 10, 0, posY)
+    btn.BackgroundColor3 = initial and Color3.fromRGB(40,120,60) or Color3.fromRGB(120,40,40)
+    btn.Text = label .. ": " .. (initial and "ON" or "OFF")
+    btn.TextColor3 = Color3.new(1,1,1)
+    btn.Font = Enum.Font.GothamBold
+    btn.TextSize = 13
+    Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 6)
+    local state = initial
+    btn.MouseButton1Click:Connect(function()
+        state = not state
+        btn.Text = label .. ": " .. (state and "ON" or "OFF")
+        btn.BackgroundColor3 = state and Color3.fromRGB(40,120,60) or Color3.fromRGB(120,40,40)
+        onChange(state)
+    end)
+    return btn
+end
 
-local distLbl = Instance.new("TextLabel", main)
-distLbl.Size = UDim2.new(1, -20, 0, 22)
-distLbl.Position = UDim2.new(0, 10, 0, 70)
-distLbl.BackgroundTransparency = 1
-distLbl.Text = "Дистанция: ---"
-distLbl.TextXAlignment = Enum.TextXAlignment.Left
-distLbl.TextColor3 = Color3.fromRGB(180, 180, 180)
-distLbl.Font = Enum.Font.Gotham
-distLbl.TextSize = 13
+makeToggle(main, 46, "AUTO-BLOCK", CFG.AutoBlock, function(s) CFG.AutoBlock = s end)
+makeToggle(main, 82, "AUTO-HIT (после блока)", CFG.AutoAttack, function(s) CFG.AutoAttack = s end)
 
--- Список игроков (TextBox для выбора по имени)
-local nameBox = Instance.new("TextBox", main)
-nameBox.Size = UDim2.new(1, -20, 0, 30)
-nameBox.Position = UDim2.new(0, 10, 0, 100)
-nameBox.PlaceholderText = "Имя игрока (пусто = ближайший)"
-nameBox.Text = ""
-nameBox.BackgroundColor3 = Color3.fromRGB(40, 40, 50)
-nameBox.TextColor3 = Color3.new(1,1,1)
-nameBox.Font = Enum.Font.Gotham
-nameBox.TextSize = 13
-nameBox.ClearTextOnFocus = false
-Instance.new("UICorner", nameBox).CornerRadius = UDim.new(0, 6)
+------------------------------------------------------------
+-- Радиус +/-
+------------------------------------------------------------
+local rLbl = Instance.new("TextLabel", main)
+rLbl.Size = UDim2.new(1, -100, 0, 26)
+rLbl.Position = UDim2.new(0, 10, 0, 120)
+rLbl.BackgroundTransparency = 1
+rLbl.Text = "Радиус: " .. CFG.Radius
+rLbl.TextXAlignment = Enum.TextXAlignment.Left
+rLbl.TextColor3 = Color3.fromRGB(220, 220, 220)
+rLbl.Font = Enum.Font.GothamBold
+rLbl.TextSize = 13
 
--- Кнопка FLING
-local flingBtn = Instance.new("TextButton", main)
-flingBtn.Size = UDim2.new(1, -20, 0, 50)
-flingBtn.Position = UDim2.new(0, 10, 0, 140)
-flingBtn.BackgroundColor3 = Color3.fromRGB(200, 40, 40)
-flingBtn.Text = "🌪 FLING (выбросить)"
-flingBtn.TextColor3 = Color3.new(1,1,1)
-flingBtn.Font = Enum.Font.GothamBold
-flingBtn.TextSize = 16
-Instance.new("UICorner", flingBtn).CornerRadius = UDim.new(0, 8)
+local rMinus = Instance.new("TextButton", main)
+rMinus.Size = UDim2.new(0, 36, 0, 26)
+rMinus.Position = UDim2.new(1, -85, 0, 120)
+rMinus.BackgroundColor3 = Color3.fromRGB(70, 70, 90)
+rMinus.Text = "-"
+rMinus.TextColor3 = Color3.new(1,1,1)
+rMinus.Font = Enum.Font.GothamBold
+rMinus.TextSize = 16
+Instance.new("UICorner", rMinus).CornerRadius = UDim.new(0, 4)
 
--- Слайдер силы (просто +/-)
-local powerLbl = Instance.new("TextLabel", main)
-powerLbl.Size = UDim2.new(1, -20, 0, 20)
-powerLbl.Position = UDim2.new(0, 10, 0, 198)
-powerLbl.BackgroundTransparency = 1
-powerLbl.Text = "Сила: " .. SETTINGS.FlingPower
-powerLbl.TextXAlignment = Enum.TextXAlignment.Left
-powerLbl.TextColor3 = Color3.fromRGB(200, 200, 200)
-powerLbl.Font = Enum.Font.Gotham
-powerLbl.TextSize = 12
+local rPlus = Instance.new("TextButton", main)
+rPlus.Size = UDim2.new(0, 36, 0, 26)
+rPlus.Position = UDim2.new(1, -45, 0, 120)
+rPlus.BackgroundColor3 = Color3.fromRGB(70, 70, 90)
+rPlus.Text = "+"
+rPlus.TextColor3 = Color3.new(1,1,1)
+rPlus.Font = Enum.Font.GothamBold
+rPlus.TextSize = 16
+Instance.new("UICorner", rPlus).CornerRadius = UDim.new(0, 4)
 
-local minusBtn = Instance.new("TextButton", main)
-minusBtn.Size = UDim2.new(0, 30, 0, 25)
-minusBtn.Position = UDim2.new(1, -75, 0, 196)
-minusBtn.BackgroundColor3 = Color3.fromRGB(70, 70, 90)
-minusBtn.Text = "-"
-minusBtn.TextColor3 = Color3.new(1,1,1)
-minusBtn.Font = Enum.Font.GothamBold
-minusBtn.TextSize = 16
-Instance.new("UICorner", minusBtn).CornerRadius = UDim.new(0, 4)
+rMinus.MouseButton1Click:Connect(function()
+    CFG.Radius = math.max(3, CFG.Radius - 1)
+    rLbl.Text = "Радиус: " .. CFG.Radius
+end)
+rPlus.MouseButton1Click:Connect(function()
+    CFG.Radius = math.min(80, CFG.Radius + 1)
+    rLbl.Text = "Радиус: " .. CFG.Radius
+end)
 
-local plusBtn = Instance.new("TextButton", main)
-plusBtn.Size = UDim2.new(0, 30, 0, 25)
-plusBtn.Position = UDim2.new(1, -40, 0, 196)
-plusBtn.BackgroundColor3 = Color3.fromRGB(70, 70, 90)
-plusBtn.Text = "+"
-plusBtn.TextColor3 = Color3.new(1,1,1)
-plusBtn.Font = Enum.Font.GothamBold
-plusBtn.TextSize = 16
-Instance.new("UICorner", plusBtn).CornerRadius = UDim.new(0, 4)
+------------------------------------------------------------
+-- Список игроков (вайтлист)
+------------------------------------------------------------
+local listLbl = Instance.new("TextLabel", main)
+listLbl.Size = UDim2.new(1, -20, 0, 20)
+listLbl.Position = UDim2.new(0, 10, 0, 154)
+listLbl.BackgroundTransparency = 1
+listLbl.Text = "Цели (пусто = все):"
+listLbl.TextXAlignment = Enum.TextXAlignment.Left
+listLbl.TextColor3 = Color3.fromRGB(200, 200, 200)
+listLbl.Font = Enum.Font.GothamBold
+listLbl.TextSize = 12
 
--- Тогл AUTO
-local autoBtn = Instance.new("TextButton", main)
-autoBtn.Size = UDim2.new(0.5, -15, 0, 30)
-autoBtn.Position = UDim2.new(0, 10, 0, 228)
-autoBtn.BackgroundColor3 = Color3.fromRGB(40, 120, 60)
-autoBtn.Text = "AUTO: ON"
-autoBtn.TextColor3 = Color3.new(1,1,1)
-autoBtn.Font = Enum.Font.GothamBold
-autoBtn.TextSize = 13
-Instance.new("UICorner", autoBtn).CornerRadius = UDim.new(0, 6)
+local allBtn = Instance.new("TextButton", main)
+allBtn.Size = UDim2.new(0, 60, 0, 22)
+allBtn.Position = UDim2.new(1, -130, 0, 153)
+allBtn.BackgroundColor3 = Color3.fromRGB(60, 90, 150)
+allBtn.Text = "Все"
+allBtn.TextColor3 = Color3.new(1,1,1)
+allBtn.Font = Enum.Font.Gotham
+allBtn.TextSize = 12
+Instance.new("UICorner", allBtn).CornerRadius = UDim.new(0, 4)
 
--- Reset character
-local resetBtn = Instance.new("TextButton", main)
-resetBtn.Size = UDim2.new(0.5, -15, 0, 30)
-resetBtn.Position = UDim2.new(0.5, 5, 0, 228)
-resetBtn.BackgroundColor3 = Color3.fromRGB(60, 80, 160)
-resetBtn.Text = "🔄 RESET ME"
-resetBtn.TextColor3 = Color3.new(1,1,1)
-resetBtn.Font = Enum.Font.GothamBold
-resetBtn.TextSize = 13
-Instance.new("UICorner", resetBtn).CornerRadius = UDim.new(0, 6)
+local noneBtn = Instance.new("TextButton", main)
+noneBtn.Size = UDim2.new(0, 60, 0, 22)
+noneBtn.Position = UDim2.new(1, -65, 0, 153)
+noneBtn.BackgroundColor3 = Color3.fromRGB(120, 60, 60)
+noneBtn.Text = "Снять"
+noneBtn.TextColor3 = Color3.new(1,1,1)
+noneBtn.Font = Enum.Font.Gotham
+noneBtn.TextSize = 12
+Instance.new("UICorner", noneBtn).CornerRadius = UDim.new(0, 4)
 
+local list = Instance.new("ScrollingFrame", main)
+list.Size = UDim2.new(1, -20, 0, 180)
+list.Position = UDim2.new(0, 10, 0, 180)
+list.BackgroundColor3 = Color3.fromRGB(30, 30, 40)
+list.BorderSizePixel = 0
+list.ScrollBarThickness = 6
+list.CanvasSize = UDim2.new(0, 0, 0, 0)
+Instance.new("UICorner", list).CornerRadius = UDim.new(0, 6)
+
+local layout = Instance.new("UIListLayout", list)
+layout.Padding = UDim.new(0, 2)
+layout.SortOrder = Enum.SortOrder.LayoutOrder
+
+local rowsByUid = {}
+
+local function refreshCanvas()
+    list.CanvasSize = UDim2.new(0, 0, 0, layout.AbsoluteContentSize.Y + 4)
+end
+
+local function updateRow(row, plr)
+    local active = isWhitelisted(plr) and (next(Whitelist) ~= nil)
+    if next(Whitelist) == nil then
+        row.BackgroundColor3 = Color3.fromRGB(50, 70, 50) -- "все" режим
+    elseif Whitelist[plr.UserId] then
+        row.BackgroundColor3 = Color3.fromRGB(40, 110, 60)
+    else
+        row.BackgroundColor3 = Color3.fromRGB(50, 50, 60)
+    end
+end
+
+local function addRow(plr)
+    if plr == LocalPlayer then return end
+    if rowsByUid[plr.UserId] then return end
+    local row = Instance.new("TextButton", list)
+    row.Size = UDim2.new(1, -8, 0, 26)
+    row.BackgroundColor3 = Color3.fromRGB(50, 50, 60)
+    row.Text = "  " .. plr.Name .. (plr.DisplayName ~= plr.Name and ("  ("..plr.DisplayName..")") or "")
+    row.TextXAlignment = Enum.TextXAlignment.Left
+    row.TextColor3 = Color3.new(1,1,1)
+    row.Font = Enum.Font.Gotham
+    row.TextSize = 12
+    Instance.new("UICorner", row).CornerRadius = UDim.new(0, 4)
+    row.MouseButton1Click:Connect(function()
+        Whitelist[plr.UserId] = not Whitelist[plr.UserId] or nil
+        for uid, r in pairs(rowsByUid) do
+            local p = Players:GetPlayerByUserId(uid)
+            if p then updateRow(r, p) end
+        end
+    end)
+    rowsByUid[plr.UserId] = row
+    updateRow(row, plr)
+    refreshCanvas()
+end
+
+local function removeRow(uid)
+    local r = rowsByUid[uid]
+    if r then r:Destroy() end
+    rowsByUid[uid] = nil
+    refreshCanvas()
+end
+
+for _, p in ipairs(Players:GetPlayers()) do addRow(p) end
+Players.PlayerAdded:Connect(addRow)
+Players.PlayerRemoving:Connect(function(p) removeRow(p.UserId) end)
+
+allBtn.MouseButton1Click:Connect(function()
+    Whitelist = {}
+    for uid, r in pairs(rowsByUid) do
+        local p = Players:GetPlayerByUserId(uid)
+        if p then updateRow(r, p) end
+    end
+end)
+
+noneBtn.MouseButton1Click:Connect(function()
+    -- помечаем всех нулём, но Whitelist должен быть НЕ пустым (иначе режим "все")
+    Whitelist = {}
+    for uid, r in pairs(rowsByUid) do
+        Whitelist[uid] = false -- любое значение, чтобы next(Whitelist) ~= nil, но isWhitelisted вернёт false
+        local p = Players:GetPlayerByUserId(uid)
+        if p then updateRow(r, p) end
+    end
+end)
+
+------------------------------------------------------------
 -- Статус
+------------------------------------------------------------
 local statusLbl = Instance.new("TextLabel", main)
-statusLbl.Size = UDim2.new(1, -20, 0, 40)
-statusLbl.Position = UDim2.new(0, 10, 1, -45)
+statusLbl.Size = UDim2.new(1, -20, 0, 18)
+statusLbl.Position = UDim2.new(0, 10, 1, -22)
 statusLbl.BackgroundTransparency = 1
-statusLbl.Text = "Готов. Хоткей: [E] - fling, [R] - reset"
+statusLbl.Text = "Готов. Кликни по нику в списке - добавить/убрать."
 statusLbl.TextColor3 = Color3.fromRGB(120, 220, 120)
 statusLbl.Font = Enum.Font.Gotham
-statusLbl.TextSize = 12
-statusLbl.TextWrapped = true
+statusLbl.TextSize = 11
 statusLbl.TextXAlignment = Enum.TextXAlignment.Left
-statusLbl.TextYAlignment = Enum.TextYAlignment.Top
 
 ------------------------------------------------------------
--- Обработчики
+-- Минимизация / закрытие
 ------------------------------------------------------------
-
 local minimized = false
 minBtn.MouseButton1Click:Connect(function()
     minimized = not minimized
-    main:TweenSize(minimized and UDim2.new(0,300,0,36) or UDim2.new(0,300,0,320),
+    main:TweenSize(minimized and UDim2.new(0,320,0,36) or UDim2.new(0,320,0,420),
         Enum.EasingDirection.Out, Enum.EasingStyle.Quad, 0.2, true)
 end)
 closeBtn.MouseButton1Click:Connect(function() gui:Destroy() end)
 
-autoBtn.MouseButton1Click:Connect(function()
-    SETTINGS.AutoTarget = not SETTINGS.AutoTarget
-    autoBtn.Text = "AUTO: " .. (SETTINGS.AutoTarget and "ON" or "OFF")
-    autoBtn.BackgroundColor3 = SETTINGS.AutoTarget
-        and Color3.fromRGB(40,120,60) or Color3.fromRGB(120,40,40)
-end)
+------------------------------------------------------------
+-- Безопасность: при респе LocalPlayer Network теряется,
+-- но fire() сама пере-резолвит. Дополнительно сбрасываем флаг
+LocalPlayer.CharacterAdded:Connect(function() reacting = false end)
 
-minusBtn.MouseButton1Click:Connect(function()
-    SETTINGS.FlingPower = math.max(10000, SETTINGS.FlingPower - 10000)
-    powerLbl.Text = "Сила: " .. SETTINGS.FlingPower
-end)
-plusBtn.MouseButton1Click:Connect(function()
-    SETTINGS.FlingPower = math.min(500000, SETTINGS.FlingPower + 10000)
-    powerLbl.Text = "Сила: " .. SETTINGS.FlingPower
-end)
-
-resetBtn.MouseButton1Click:Connect(resetCharacter)
-
-local function setStatus(text, color)
-    statusLbl.Text = text
-    statusLbl.TextColor3 = color or Color3.fromRGB(120, 220, 120)
-end
-
-local function resolveTarget()
-    local typed = nameBox.Text and nameBox.Text:gsub("^%s+",""):gsub("%s+$","") or ""
-    if typed ~= "" then
-        local low = typed:lower()
-        for _, p in ipairs(Players:GetPlayers()) do
-            if p ~= LocalPlayer and (p.Name:lower():sub(1, #low) == low
-               or (p.DisplayName and p.DisplayName:lower():sub(1, #low) == low)) then
-                return p
-            end
-        end
-        return nil, "Игрок '" .. typed .. "' не найден"
-    end
-    if SETTINGS.AutoTarget then
-        return getNearestPlayer()
-    end
-    return nil, "Введи имя или включи AUTO"
-end
-
-local function doFling()
-    local target, err = resolveTarget()
-    if not target then
-        setStatus(err or "Нет цели", Color3.fromRGB(255,120,120))
-        return
-    end
-    setStatus("Fling -> " .. target.Name .. " ...", Color3.fromRGB(255,200,80))
-    local ok, msg = flingPlayer(target)
-    setStatus(msg, ok and Color3.fromRGB(120,220,120) or Color3.fromRGB(255,150,80))
-end
-
-flingBtn.MouseButton1Click:Connect(function() task.spawn(doFling) end)
-
-UserInputService.InputBegan:Connect(function(input, processed)
-    if processed then return end
-    if input.KeyCode == Enum.KeyCode.E then
-        task.spawn(doFling)
-    elseif input.KeyCode == Enum.KeyCode.R then
-        resetCharacter()
-    end
-end)
-
--- Реселект персонажа после respawn
-LocalPlayer.CharacterAdded:Connect(function() flinging = false end)
-
--- Обновление инфо
-RunService.Heartbeat:Connect(function()
-    local target, dist
-    local typed = nameBox.Text and nameBox.Text:gsub("^%s+",""):gsub("%s+$","") or ""
-    if typed ~= "" then
-        for _, p in ipairs(Players:GetPlayers()) do
-            if p ~= LocalPlayer and p.Name:lower():sub(1,#typed) == typed:lower() then
-                target = p
-                local _, myRoot = getMyChar()
-                local hrp = p.Character and p.Character:FindFirstChild("HumanoidRootPart")
-                if myRoot and hrp then dist = (myRoot.Position - hrp.Position).Magnitude end
-                break
-            end
-        end
-    else
-        target, dist = getNearestPlayer()
-    end
-    if target then
-        targetLbl.Text = "Цель: " .. target.Name
-        distLbl.Text   = dist and ("Дистанция: %.1f studs"):format(dist) or "Дистанция: ---"
-    else
-        targetLbl.Text = "Цель: ---"
-        distLbl.Text   = "Дистанция: ---"
-    end
-end)
-
-setStatus("GUI загружен. Жми FLING или [E].")
-print("[NDS-KillGui] Загружен. Игрок:", LocalPlayer.Name)
+print("[AutoBlockGui] Загружен. LP:", LocalPlayer.Name)
